@@ -6,7 +6,75 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.2.0] — 2026-04-07
+
+Security hardening release. Addresses AI-powered attacker threat model:
+reduce what they can see, reduce how fast they can probe,
+increase how much you see when they try.
+
+### Added
+
+**`care/security/` — new security layer**
+- `rate_limiter.py` — per-IP sliding window rate limiting (60 req/min per route, configurable).
+  Anomaly detection: chain probe pattern (`/curvature`→`/escape-route`→`/recommend`→`/apply`
+  in a short window), all-endpoint burst pattern. Exponential lockdown on repeated anomalies.
+- `audit_log.py` — immutable append-only audit log. Three backends: `file` (append-only JSONL,
+  fsync on every write), `redis` (Redis Streams with maxlen cap), `memory` (tests only).
+  Records IP, route, method, payload SHA-256 hash (never raw payload), decision, anomaly flags,
+  membrane flags, latency. Survives process compromise.
+- `input_validator.py` — typed input validation. Lab mode (size/depth limits only) and prod mode
+  (strict: reject unknown top-level shapes, require `_type` field). NaN/Inf rejection. Configurable
+  max payload size (64KB default), max nesting depth, max key count, max string length.
+- `canary.py` — CARE watching CARE. Background task encodes CARE's own runtime state
+  (anomaly rate, unique IPs, error rate, endpoint entropy, lockdown count) as a vector,
+  runs it through the full CARE pipeline, and alerts when risk R(x) shifts >25% from baseline
+  or severity escalates. Fires configurable alert callback.
+
+**`care/membranes/lockdown.py` — security membrane extensions**
+- System-wide lockdown mode: freeze all delta application until manual operator review.
+  Engages automatically when rate limiter locks an IP.
+- Speed membrane: block deltas arriving faster than human typing speed (<2s interval).
+  Automated scripts submit in milliseconds; humans take seconds.
+- HMAC attestation membrane: require signed token for high-impact actions
+  (`quarantine`, `segment_network`, `disable_capability`).
+
+**`care/api/server.py` — hardened server**
+- HTTP middleware: payload size check before parsing, rate limit check, audit log on every request.
+- Background canary task running on configurable interval (default 60s).
+- `/security/status` — operator visibility: rate limiter stats, locked IPs, canary snapshot,
+  audit log tail, runtime counters.
+- `/security/lockdown/release` — manual lockdown release after operator review.
+- Input validation wired into every endpoint via `_pipeline()`.
+
+**Tests**
+- 25 new security tests across `TestRateLimiter`, `TestAuditLog`, `TestInputValidator`,
+  `TestLockdownMembrane`, `TestSecurityAPI`.
+- `autouse` fixture resets rate limiter state between every test.
+- Total: **80/80 passing**.
+
+### Changed
+- `care/api/server.py` — all endpoints now validate input before processing.
+- `care/api/server.py` — `/apply` checks security membranes before any delta application.
+
+### Configuration (new environment variables)
+| Variable | Default | Description |
+|---|---|---|
+| `CARE_AUDIT_BACKEND` | `file` | `file` \| `redis` \| `memory` |
+| `CARE_AUDIT_FILE` | `/tmp/care_audit.jsonl` | Audit log file path |
+| `CARE_AUDIT_REDIS_URL` | `redis://localhost:6379` | Redis URL for audit backend |
+| `CARE_VALIDATION_MODE` | `lab` | `lab` \| `prod` |
+| `CARE_MAX_PAYLOAD_BYTES` | `65536` | Max request payload size |
+| `CARE_LOCKDOWN_ENABLED` | `true` | Enable lockdown membrane |
+| `CARE_MIN_DELTA_INTERVAL` | `2.0` | Min seconds between deltas (speed membrane) |
+| `CARE_ATTESTATION_SECRET` | `` | HMAC secret for high-impact delta attestation |
+| `CARE_CANARY_ENABLED` | `true` | Enable self-monitoring canary |
+| `CARE_CANARY_INTERVAL` | `60` | Canary check interval (seconds) |
+| `CARE_CANARY_RISK_DELTA` | `0.25` | Risk delta threshold for canary alert |
+
+---
+
 ## [0.1.0] — 2026-04-06
+
 
 Initial release.
 

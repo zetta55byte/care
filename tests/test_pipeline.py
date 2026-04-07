@@ -493,3 +493,218 @@ class TestAPI:
     def test_empty_state_handled(self, client):
         r = client.post("/risk", json={"state": {}, "potential": "quadratic"})
         assert r.status_code == 200
+
+
+# ── Security tests ────────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def reset_rate_limiter():
+    """Reset rate limiter between every test — prevents cross-test rate limit triggers."""
+    from care.security import rate_limiter as rl
+    rl._limiter = rl.RateLimiter()
+    yield
+    rl._limiter = rl.RateLimiter()
+
+
+class TestRateLimiter:
+    def test_allows_normal_request(self):
+        from care.security.rate_limiter import RateLimiter
+        rl = RateLimiter()
+        allowed, reason = rl.check("10.0.0.1", "/risk")
+        assert allowed is True
+
+    def test_blocks_after_limit(self):
+        from care.security.rate_limiter import RateLimiter, RATE_LIMIT_PER_MIN
+        rl = RateLimiter()
+        for _ in range(RATE_LIMIT_PER_MIN):
+            rl.check("10.0.0.2", "/risk")
+        allowed, reason = rl.check("10.0.0.2", "/risk")
+        assert allowed is False
+        assert "Rate limit" in reason
+
+    def test_different_routes_independent(self):
+        from care.security.rate_limiter import RateLimiter, RATE_LIMIT_PER_MIN
+        rl = RateLimiter()
+        for _ in range(RATE_LIMIT_PER_MIN):
+            rl.check("10.0.0.3", "/risk")
+        # /curvature is a different route — should still be allowed
+        allowed, _ = rl.check("10.0.0.3", "/curvature")
+        assert allowed is True
+
+    def test_anomaly_chain_probe_detection(self):
+        from care.security.rate_limiter import RateLimiter, SENSITIVE_CHAIN
+        rl = RateLimiter()
+        ip = "10.0.0.4"
+        for route in SENSITIVE_CHAIN:
+            rl.check(ip, route)
+        stats = rl.get_stats(ip)
+        assert stats["anomaly_count"] >= 1
+
+    def test_lockdown_after_repeated_anomalies(self):
+        from care.security.rate_limiter import RateLimiter, SENSITIVE_CHAIN, LOCKDOWN_ANOMALY_THRESHOLD
+        rl = RateLimiter()
+        ip = "10.0.0.5"
+        import time
+        for _ in range(LOCKDOWN_ANOMALY_THRESHOLD + 1):
+            for route in SENSITIVE_CHAIN:
+                rl.check(ip, route)
+        stats = rl.get_stats(ip)
+        assert stats["locked"] is True
+
+    def test_get_stats_unknown_ip(self):
+        from care.security.rate_limiter import RateLimiter
+        rl = RateLimiter()
+        stats = rl.get_stats("99.99.99.99")
+        assert stats["known"] is False
+
+
+class TestAuditLog:
+    def test_memory_backend_records(self):
+        from care.security.audit_log import AuditLog, _MemoryBackend, make_entry
+        log = AuditLog()
+        log._backend = _MemoryBackend()
+        entry = make_entry("1.2.3.4", "/risk", "POST", b'{}', "allowed", 200)
+        log.record(entry)
+        assert log.count() == 1
+
+    def test_file_backend_appends(self, tmp_path):
+        from care.security.audit_log import _FileBackend, make_entry
+        fb = _FileBackend(str(tmp_path / "audit.jsonl"))
+        e1 = make_entry("1.2.3.4", "/risk", "POST", b'{}', "allowed", 200)
+        e2 = make_entry("1.2.3.4", "/curvature", "POST", b'{}', "allowed", 200)
+        fb.append(e1)
+        fb.append(e2)
+        assert fb.count() == 2
+        tail = fb.tail(5)
+        assert len(tail) == 2
+
+    def test_entry_has_required_fields(self):
+        from care.security.audit_log import make_entry
+        e = make_entry("1.2.3.4", "/risk", "POST", b'{"state":{}}', "allowed", 200)
+        d = e.to_dict()
+        for field in ["request_id", "timestamp_utc", "ip", "route", "decision",
+                      "payload_hash", "status_code"]:
+            assert field in d
+
+    def test_payload_hash_not_payload(self):
+        """Audit log must never store raw payload — only hash."""
+        from care.security.audit_log import make_entry
+        sensitive = b'{"admin_password": "hunter2"}'
+        e = make_entry("1.2.3.4", "/apply", "POST", sensitive, "allowed", 200)
+        d = e.to_dict()
+        assert "hunter2" not in str(d)
+        assert len(d["payload_hash"]) == 16  # truncated SHA-256
+
+
+class TestInputValidator:
+    def test_valid_request_passes(self):
+        from care.security.input_validator import validate_request
+        validate_request({"user_count": 5}, "privilege", None)
+
+    def test_oversized_payload_detected(self):
+        from care.security.input_validator import validate_payload_size, MAX_PAYLOAD_BYTES, ValidationError
+        with pytest.raises(ValidationError):
+            validate_payload_size(b"x" * (MAX_PAYLOAD_BYTES + 1))
+
+    def test_nan_rejected(self):
+        from care.security.input_validator import validate_state, ValidationError
+        with pytest.raises(ValidationError, match="NaN"):
+            validate_state({"value": float("nan")})
+
+    def test_inf_rejected(self):
+        from care.security.input_validator import validate_state, ValidationError
+        with pytest.raises(ValidationError, match="Inf"):
+            validate_state({"value": float("inf")})
+
+    def test_invalid_potential_rejected(self):
+        from care.security.input_validator import validate_potential, ValidationError
+        with pytest.raises(ValidationError):
+            validate_potential("evil_potential")
+
+    def test_invalid_backend_rejected(self):
+        from care.security.input_validator import validate_backend, ValidationError
+        with pytest.raises(ValidationError):
+            validate_backend("cuda_magic")
+
+    def test_deep_nesting_rejected(self):
+        from care.security.input_validator import validate_state, ValidationError, MAX_STATE_DEPTH
+        deep = {}
+        current = deep
+        for _ in range(MAX_STATE_DEPTH + 2):
+            current["x"] = {}
+            current = current["x"]
+        with pytest.raises(ValidationError, match="nesting"):
+            validate_state(deep)
+
+
+class TestLockdownMembrane:
+    def setup_method(self):
+        from care.membranes import lockdown
+        lockdown._lockdown_active = False
+        lockdown._lockdown_reason = ""
+        lockdown._last_delta_time = 0.0
+
+    def teardown_method(self):
+        from care.membranes import lockdown
+        lockdown._lockdown_active = False
+        lockdown._last_delta_time = 0.0
+
+    def test_normal_delta_passes(self):
+        from care.membranes.lockdown import check_lockdown_membrane
+        ok, msg = check_lockdown_membrane({"action_type": "rate_limit"})
+        assert ok is True
+
+    def test_lockdown_blocks_all(self):
+        from care.membranes.lockdown import engage_lockdown, check_lockdown_membrane
+        engage_lockdown("test lockdown")
+        ok, msg = check_lockdown_membrane({"action_type": "rate_limit"})
+        assert ok is False
+        assert "lockdown" in msg.lower()
+
+    def test_release_allows_again(self):
+        from care.membranes.lockdown import engage_lockdown, release_lockdown, check_lockdown_membrane
+        engage_lockdown("test")
+        release_lockdown()
+        ok, _ = check_lockdown_membrane({"action_type": "rate_limit"})
+        assert ok is True
+
+    def test_speed_membrane_blocks_fast_delta(self):
+        import time
+        from care.membranes.lockdown import check_speed_membrane
+        from care.membranes import lockdown
+        lockdown._last_delta_time = time.time()  # simulate very recent delta
+        ok, msg = check_speed_membrane({"action_type": "rate_limit"})
+        assert ok is False
+        assert "fast" in msg.lower()
+
+    def test_attestation_not_required_for_low_impact(self):
+        from care.membranes.lockdown import check_attestation_membrane
+        ok, msg = check_attestation_membrane({"action_type": "add_mfa"})
+        assert ok is True
+
+
+class TestSecurityAPI:
+    def test_security_status_endpoint(self, client):
+        r = client.get("/security/status")
+        assert r.status_code == 200
+        d = r.json()
+        assert "lockdown" in d
+        assert "canary" in d
+        assert "rate_limiter" in d
+        assert "audit_log" in d
+
+    def test_lockdown_release_when_not_locked(self, client):
+        r = client.post("/security/lockdown/release")
+        assert r.status_code == 200
+        assert r.json()["status"] == "not_locked"
+
+    def test_oversized_payload_returns_413(self, client):
+        from care.security.input_validator import MAX_PAYLOAD_BYTES
+        big_state = {"data": "x" * (MAX_PAYLOAD_BYTES + 100)}
+        import json
+        r = client.post(
+            "/risk",
+            content=json.dumps({"state": big_state, "potential": "quadratic"}),
+            headers={"Content-Type": "application/json"},
+        )
+        assert r.status_code == 413
